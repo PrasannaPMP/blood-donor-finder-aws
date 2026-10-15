@@ -1,0 +1,580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Blood Donor Finder - BCSE355L course project.
+  VPC, ALB, Auto Scaling EC2, DynamoDB + Streams, Lambda, SNS, CloudFront, WAF, CloudWatch, Budgets, IAM.
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket holding app.zip (created by deploy.sh)
+  ArtifactKey:
+    Type: String
+    Default: app.zip
+  AlertEmail:
+    Type: String
+    Description: Email for admin alarms and budget alerts
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+  BudgetAmountUSD:
+    Type: Number
+    Default: 5
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ------------------------------------------------------------------ 1. VPC (networking)
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: blood-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway }
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: blood-subnet-a }]
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: blood-subnet-b }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: blood-rt }]
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  SubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetA, RouteTableId: !Ref RouteTable }
+  SubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetB, RouteTableId: !Ref RouteTable }
+
+  # Free gateway endpoints: DynamoDB and S3 traffic stays on the AWS network
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RouteTable]
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref RouteTable]
+
+  # Security groups: internet -> ALB:80 only; ALB -> EC2:3000 only. No SSH port open.
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to the load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow app traffic only from the load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref ALBSecurityGroup }
+
+  # ------------------------------------------------------------------ 2. DynamoDB + Streams
+  DonorsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-donors
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: donorId, AttributeType: S }]
+      KeySchema: [{ AttributeName: donorId, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-requests
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: requestId, AttributeType: S }]
+      KeySchema: [{ AttributeName: requestId, KeyType: HASH }]
+      StreamSpecification: { StreamViewType: NEW_IMAGE }   # every new request -> Lambda
+      TimeToLiveSpecification: { AttributeName: expiresAt, Enabled: true }  # requests vanish after 7 days
+      SSESpecification: { SSEEnabled: true }
+
+  # ------------------------------------------------------------------ 3. SNS
+  DonorAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-donor-alerts
+      DisplayName: Blood Donor Finder
+  AdminAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-admin-alerts
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+
+  # ------------------------------------------------------------------ 4. Lambda reading the stream
+  StreamFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: stream-to-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:DescribeStream, dynamodb:ListStreams]
+                Resource: !GetAtt RequestsTable.StreamArn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref DonorAlertTopic
+
+  StreamFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-donor-notifier
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt StreamFunctionRole.Arn
+      Environment:
+        Variables: { TOPIC_ARN: !Ref DonorAlertTopic }
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          sns = boto3.client('sns')
+          TOPIC = os.environ['TOPIC_ARN']
+
+          # Which donor groups can give blood to a patient of each group
+          CAN_RECEIVE_FROM = {
+              'O-': ['O-'],
+              'O+': ['O+', 'O-'],
+              'A-': ['A-', 'O-'],
+              'A+': ['A+', 'A-', 'O+', 'O-'],
+              'B-': ['B-', 'O-'],
+              'B+': ['B+', 'B-', 'O+', 'O-'],
+              'AB-': ['AB-', 'A-', 'B-', 'O-'],
+              'AB+': ['AB+', 'AB-', 'A+', 'A-', 'B+', 'B-', 'O+', 'O-'],
+          }
+
+          def s(img, k):
+              return img.get(k, {}).get('S') or img.get(k, {}).get('N', '')
+
+          def handler(event, context):
+              sent = 0
+              for rec in event.get('Records', []):
+                  if rec['eventName'] != 'INSERT':
+                      continue  # only brand-new requests; TTL deletes are ignored
+                  r = rec['dynamodb']['NewImage']
+                  if r.get('isSeed', {}).get('BOOL'):
+                      continue  # demo sample request: never email real donors
+                  group = s(r, 'bloodGroup')
+                  donors = CAN_RECEIVE_FROM.get(group)
+                  if not donors:
+                      continue
+                  body = (f"URGENT: {group} blood needed\n\n"
+                          f"Patient: {s(r, 'patientName')}\n"
+                          f"Units needed: {s(r, 'units')}\n"
+                          f"Hospital: {s(r, 'hospital')}, {s(r, 'city')}\n"
+                          f"Contact: {s(r, 'contactName')} - {s(r, 'contactPhone')}\n\n"
+                          f"You are receiving this because your blood group can be given to a {group} patient.\n"
+                          "If you can donate, please call the contact above.\n\n"
+                          "- Blood Donor Finder")
+                  # String.Array attribute: SNS delivers to any donor whose filter group is in this list
+                  sns.publish(TopicArn=TOPIC,
+                              Subject=f"URGENT: {group} blood needed at {s(r, 'hospital')}"[:100],
+                              Message=body,
+                              MessageAttributes={'bloodGroup': {'DataType': 'String.Array',
+                                                                'StringValue': json.dumps(donors)}})
+                  sent += 1
+              print(f"alerts sent: {sent}")
+              return {'sent': sent}
+
+  StreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt RequestsTable.StreamArn
+      FunctionName: !Ref StreamFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+
+  # ------------------------------------------------------------------ 5. IAM
+  # EC2 gets permissions from a role: no access keys stored on the server
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager instead of SSH
+      Policies:
+        - PolicyName: donor-app-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+                Resource: [!GetAtt DonorsTable.Arn, !GetAtt RequestsTable.Arn]
+              - Effect: Allow
+                Action: sns:Subscribe
+                Resource: !Ref DonorAlertTopic
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/${ArtifactKey}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref InstanceRole] }
+
+  # IAM group for the two team members: read-only console access for demos and viva
+  ProjectTeamGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-team-readonly
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/ReadOnlyAccess]
+
+  # ------------------------------------------------------------------ 6. EC2 + Auto Scaling + ALB
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: blood-app }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y unzip
+            dnf install -y nodejs22 || dnf install -y nodejs20 || dnf install -y nodejs
+            for v in 22 20; do
+              if [ -x /usr/bin/node-$v ]; then ln -sf /usr/bin/node-$v /usr/local/bin/node; break; fi
+            done
+            [ -x /usr/local/bin/node ] || ln -sf "$(command -v node)" /usr/local/bin/node
+            mkdir -p /opt/blood && cd /opt/blood
+            aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} app.zip --region ${AWS::Region}
+            unzip -o app.zip && rm app.zip
+            useradd --system --no-create-home blood || true
+            chown -R blood:blood /opt/blood
+            cat > /etc/systemd/system/blood.service <<'EOF'
+            [Unit]
+            Description=Blood Donor Finder app
+            After=network-online.target
+            [Service]
+            User=blood
+            WorkingDirectory=/opt/blood
+            ExecStart=/usr/local/bin/node server.js
+            Restart=always
+            Environment=PORT=3000
+            Environment=AWS_REGION=${AWS::Region}
+            Environment=DONORS_TABLE=${DonorsTable}
+            Environment=REQUESTS_TABLE=${RequestsTable}
+            Environment=TOPIC_ARN=${DonorAlertTopic}
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now blood
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 3000
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref SubnetA, !Ref SubnetB]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [DefaultRoute, SubnetARoute, SubnetBRoute]
+    UpdatePolicy:                        # new app version -> replace servers one at a time, no downtime
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT3M
+    Properties:
+      VPCZoneIdentifier: [!Ref SubnetA, !Ref SubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - { Key: Name, Value: blood-app, PropagateAtLaunch: true }
+
+  # Emergency appeals get shared widely -> sudden traffic. Add instances when average CPU passes 50%.
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 50
+
+  # ------------------------------------------------------------------ 7. CloudFront
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Blood Donor Finder
+        PriceClass: PriceClass_200        # includes edge locations in India
+        HttpVersion: http2
+        Origins:
+          - Id: alb
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig: { OriginProtocolPolicy: http-only, HTTPPort: 80 }
+        DefaultCacheBehavior:            # static page: cached at the edge
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6          # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: /api/*          # live stock: never cached
+            TargetOriginId: alb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+
+  # ------------------------------------------------------------------ 7b. AWS WAF (on the ALB)
+  # REGIONAL web ACL on the load balancer. Traffic arrives via CloudFront, so rate limits count the
+  # real visitor IP from the X-Forwarded-For header that CloudFront adds.
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-waf
+      Scope: REGIONAL
+      Description: Rate limiting + common attack protection for Blood Donor Finder
+      DefaultAction: { Allow: {} }
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub '${AWS::StackName}-waf' }
+      CustomResponseBodies:
+        TooMany:
+          ContentType: APPLICATION_JSON
+          Content: '{"error":"Too many requests from your network. Please wait a few minutes and try again."}'
+      Rules:
+        # 1. Stop fake-emergency spam: max 10 new blood requests per IP per 5 minutes
+        - Name: limit-blood-requests
+          Priority: 0
+          Action:
+            Block:
+              CustomResponse: { ResponseCode: 429, CustomResponseBodyKey: TooMany }
+          Statement:
+            RateBasedStatement:
+              Limit: 10
+              EvaluationWindowSec: 300
+              AggregateKeyType: FORWARDED_IP
+              ForwardedIPConfig: { HeaderName: X-Forwarded-For, FallbackBehavior: MATCH }
+              ScopeDownStatement:
+                AndStatement:
+                  Statements:
+                    - ByteMatchStatement:
+                        FieldToMatch: { UriPath: {} }
+                        PositionalConstraint: STARTS_WITH
+                        SearchString: /api/requests
+                        TextTransformations: [{ Priority: 0, Type: LOWERCASE }]
+                    - ByteMatchStatement:
+                        FieldToMatch: { Method: {} }
+                        PositionalConstraint: EXACTLY
+                        SearchString: POST
+                        TextTransformations: [{ Priority: 0, Type: NONE }]
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: limit-blood-requests }
+
+        # 2. Stop bots flooding the site: max 500 requests per IP per 5 minutes
+        - Name: limit-all-traffic
+          Priority: 1
+          Action:
+            Block:
+              CustomResponse: { ResponseCode: 429, CustomResponseBodyKey: TooMany }
+          Statement:
+            RateBasedStatement:
+              Limit: 500
+              EvaluationWindowSec: 300
+              AggregateKeyType: FORWARDED_IP
+              ForwardedIPConfig: { HeaderName: X-Forwarded-For, FallbackBehavior: MATCH }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: limit-all-traffic }
+
+        # 3. AWS-managed protection against SQL injection attempts
+        - Name: aws-sqli
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesSQLiRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: aws-sqli }
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ------------------------------------------------------------------ 8. CloudWatch
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: App servers above 80% CPU for 10 minutes
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: AutoScalingGroupName, Value: !Ref AutoScalingGroup }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AdminAlertTopic]
+
+  Http5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: App returning server errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AdminAlertTopic]
+
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No healthy app servers behind the load balancer
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AdminAlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-dashboard
+      DashboardBody: !Sub
+        - |
+          {"widgets":[
+           {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Requests (ALB)","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Lb}"]]}},
+           {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Errors and latency","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/ApplicationELB","HTTPCode_Target_5XX_Count","LoadBalancer","${Lb}",{"stat":"Sum"}],
+                       [".","TargetResponseTime",".",".",{"stat":"Average","yAxis":"right"}]]}},
+           {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"EC2 CPU and instance count","region":"${AWS::Region}","period":60,
+            "metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${AutoScalingGroup}",{"stat":"Average"}],
+                       ["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${AutoScalingGroup}",{"stat":"Average","yAxis":"right"}]]}},
+           {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"DynamoDB activity and donor alerts sent","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","${DonorsTable}"],
+                       [".","ConsumedWriteCapacityUnits","TableName","${RequestsTable}"],
+                       ["AWS/SNS","NumberOfMessagesPublished","TopicName","${TopicName}"],
+                       ["AWS/Lambda","Invocations","FunctionName","${StreamFunction}"]]}},
+           {"type":"metric","x":0,"y":12,"width":24,"height":6,"properties":{"title":"WAF: allowed vs blocked requests","region":"${AWS::Region}","stat":"Sum","period":60,
+            "metrics":[["AWS/WAFV2","AllowedRequests","WebACL","${AWS::StackName}-waf","Region","${AWS::Region}","Rule","ALL"],
+                       [".","BlockedRequests",".",".",".",".",".","ALL"]]}}
+          ]}
+        - Lb: !GetAtt LoadBalancer.LoadBalancerFullName
+          TopicName: !GetAtt DonorAlertTopic.TopicName
+
+  # ------------------------------------------------------------------ 9. Budgets
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetAmountUSD, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  WebsiteURL:
+    Description: Public site through CloudFront (share this one)
+    Value: !Sub https://${Distribution.DomainName}
+  LoadBalancerURL:
+    Description: Direct ALB address (for testing)
+    Value: !Sub http://${LoadBalancer.DNSName}
+  DashboardURL:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard
+  DonorsTableName:
+    Value: !Ref DonorsTable
+  RequestsTableName:
+    Value: !Ref RequestsTable
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  WebACLName:
+    Value: !Sub ${AWS::StackName}-waf
